@@ -1,29 +1,40 @@
 import sys
 import os
-import hashlib
 import json
+import hashlib
 import datetime
+from dotenv import load_dotenv
 
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.serialization import BestAvailableEncryption
 
-from PySide6 import QtWidgets, QtGui, QtCore
-
-
-LEDGER = "ledger.json"
+from supabase import create_client
+from PySide6 import QtWidgets, QtCore
 
 
 # =====================================================
-# UTILIDADES CRIPTOGRAFICAS Y DE LEDGER
+# CONFIGURACIÓN SUPABASE
+# =====================================================
+
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# =====================================================
+# CRIPTOGRAFÍA
 # =====================================================
 
 def generar_claves(usuario="estudiante"):
-    """Genera par de claves RSA 3072 y las guarda en disco."""
     private_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=3072
     )
+
     public_key = private_key.public_key()
 
     with open(f"{usuario}_priv.pem", "wb") as f:
@@ -45,7 +56,6 @@ def generar_claves(usuario="estudiante"):
 
 
 def calcular_hash(path):
-    """Calcula hash SHA 256 de un archivo."""
     sha = hashlib.sha256()
     with open(path, "rb") as f:
         for bloque in iter(lambda: f.read(4096), b""):
@@ -54,7 +64,6 @@ def calcular_hash(path):
 
 
 def firmar(hash_hex, priv_key_path):
-    """Firma el hash con la llave privada RSA."""
     with open(priv_key_path, "rb") as f:
         private_key = serialization.load_pem_private_key(
             f.read(),
@@ -62,25 +71,25 @@ def firmar(hash_hex, priv_key_path):
         )
 
     signature = private_key.sign(
-        hash_hex.encode("utf8"),
+        bytes.fromhex(hash_hex),
         padding.PSS(
             mgf=padding.MGF1(hashes.SHA256()),
             salt_length=padding.PSS.MAX_LENGTH,
         ),
         hashes.SHA256(),
     )
+
     return signature.hex()
 
 
 def verificar(hash_hex, firma_hex, pub_key_path):
-    """Verifica la firma de un hash con la llave pública RSA."""
     with open(pub_key_path, "rb") as f:
         public_key = serialization.load_pem_public_key(f.read())
 
     try:
         public_key.verify(
             bytes.fromhex(firma_hex),
-            hash_hex.encode("utf8"),
+            bytes.fromhex(hash_hex),
             padding.PSS(
                 mgf=padding.MGF1(hashes.SHA256()),
                 salt_length=padding.PSS.MAX_LENGTH,
@@ -92,71 +101,60 @@ def verificar(hash_hex, firma_hex, pub_key_path):
         return False
 
 
-def cargar_ledger():
-    """
-    Carga el ledger desde disco.
-    Si el archivo no existe o su contenido no es compatible con el nuevo formato,
-    crea un ledger vacio y lo devuelve.
-    """
-    estructura_requerida = {"archivo", "hash", "firma", "timestamp", "hash_prev"}
-
-    if not os.path.exists(LEDGER):
-        with open(LEDGER, "w", encoding="utf8") as f:
-            json.dump([], f, indent=4)
-        return []
-
-    try:
-        with open(LEDGER, "r", encoding="utf8") as f:
-            data = json.load(f)
-
-        if not isinstance(data, list):
-            raise ValueError("Ledger no es una lista")
-
-        limpio = []
-        for entrada in data:
-            if isinstance(entrada, dict) and estructura_requerida.issubset(entrada.keys()):
-                limpio.append(entrada)
-
-        # Si ninguna entrada cumple la estructura, reseteamos
-        if not limpio and data:
-            raise ValueError("Formato antiguo incompatible")
-
-        return limpio
-
-    except Exception:
-        # Reinicio seguro del ledger
-        with open(LEDGER, "w", encoding="utf8") as f:
-            json.dump([], f, indent=4)
-        return []
-
-
-def guardar_ledger(data):
-    """Guarda el ledger en disco."""
-    with open(LEDGER, "w", encoding="utf8") as f:
-        json.dump(data, f, indent=4)
-
-
-def crear_recibo(nombre_archivo, hash_actual, firma, hash_anterior):
-    """Construye el bloque o recibo que se añade al ledger."""
-    ts = datetime.datetime.utcnow().isoformat() + "Z"
-    return {
-        "archivo": nombre_archivo,
-        "hash": hash_actual,
-        "firma": firma,
-        "timestamp": ts,
-        "hash_prev": hash_anterior,
-    }
-
-
 # =====================================================
-# CALCULO MANUAL DE MERKLE ROOT Y VALIDACION DE CADENA
+# BLOCKCHAIN / LEDGER
 # =====================================================
+
+def calcular_block_hash(recibo):
+    data = json.dumps(
+        {
+            "archivo": recibo["archivo"],
+            "hash": recibo["hash"],
+            "firma": recibo["firma"],
+            "timestamp": recibo["timestamp"],
+            "hash_prev": recibo["hash_prev"],
+        },
+        sort_keys=True
+    ).encode("utf8")
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def obtener_ultimo_block_hash():
+    res = supabase.table("ledger_entries") \
+        .select("block_hash") \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+
+    if res.data:
+        return res.data[0]["block_hash"]
+    return None
+
+
+def cargar_ledger_db():
+    res = supabase.table("ledger_entries") \
+        .select("*") \
+        .order("created_at") \
+        .execute()
+    return res.data
+
+
+def verificar_cadena(ledger):
+    for i in range(1, len(ledger)):
+        if ledger[i]["hash_prev"] != ledger[i - 1]["block_hash"]:
+            return False
+    return True
+
+
+def verificar_firmas(ledger):
+    for r in ledger:
+        if not verificar(r["hash"], r["firma"], "estudiante_pub.pem"):
+            return False
+    return True
+
 
 def merkle_root(hashes):
-    """
-    Calcula la raiz de Merkle de una lista de hashes hexadecimales.
-    Si la lista esta vacia devuelve None.
-    """
     if not hashes:
         return None
 
@@ -164,236 +162,139 @@ def merkle_root(hashes):
     while len(nivel) > 1:
         siguiente = []
         for i in range(0, len(nivel), 2):
-            izquierda = nivel[i]
-            derecha = nivel[i + 1] if i + 1 < len(nivel) else izquierda
-            combinado = (izquierda + derecha).encode("utf8")
+            izq = nivel[i]
+            der = nivel[i + 1] if i + 1 < len(nivel) else izq
+            combinado = (izq + der).encode("utf8")
             siguiente.append(hashlib.sha256(combinado).hexdigest())
         nivel = siguiente
+
     return nivel[0]
 
 
-def verificar_cadena(ledger):
-    """
-    Verifica que cada bloque apunte correctamente al hash del anterior.
-    Devuelve True si toda la cadena es consistente.
-    """
-    if not ledger:
-        return True
-
-    for i in range(1, len(ledger)):
-        if ledger[i]["hash_prev"] != ledger[i - 1]["hash"]:
-            return False
-    return True
-
-
 # =====================================================
-# INTERFAZ MODERNA TIPO CYBERSECURITY UI
+# UI PRINCIPAL
 # =====================================================
 
 class LockerUI(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Locker Digital Avanzado con Auditoria")
+        self.setWindowTitle("Locker Digital con Auditoría – Supabase")
         self.resize(860, 580)
 
-        self.setStyleSheet("""
-        QMainWindow { background-color: #0f172a; }
-        QLabel, QPushButton, QListWidget {
-            color: #f9fafb;
-            font-size: 15px;
-            font-family: Segoe UI;
-        }
-        QPushButton {
-            background-color: #1e40af;
-            border-radius: 6px;
-            padding: 8px 14px;
-        }
-        QPushButton:hover {
-            background-color: #1d4ed8;
-        }
-        QListWidget {
-            background-color: #020617;
-            border: 1px solid #1f2937;
-        }
-        """)
-
         contenedor = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(16)
+        layout = QtWidgets.QVBoxLayout(contenedor)
 
-        titulo = QtWidgets.QLabel("Locker Digital con Hash, Firma Digital y Auditoria Encadenada")
-        titulo.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        titulo.setStyleSheet("font-size: 22px; font-weight: bold; color: #60a5fa;")
+        titulo = QtWidgets.QLabel("Locker Digital con Firma y Blockchain")
+        titulo.setAlignment(QtCore.Qt.AlignCenter)
+        titulo.setStyleSheet("font-size: 22px; font-weight: bold;")
         layout.addWidget(titulo)
 
-        descripcion = QtWidgets.QLabel(
-            "El sistema registra evidencias, calcula su hash SHA 256, firma digitalmente el registro con RSA 3072, "
-            "las encadena en un ledger y permite auditar la integridad mediante una raiz de Merkle."
-        )
-        descripcion.setWordWrap(True)
-        descripcion.setStyleSheet("font-size: 13px; color: #e5e7eb;")
-        layout.addWidget(descripcion)
-
-        self.boton_seleccionar = QtWidgets.QPushButton("Seleccionar archivo para registrar en el locker")
-        self.boton_seleccionar.clicked.connect(self.seleccionar_archivo)
-        layout.addWidget(self.boton_seleccionar)
+        self.btn = QtWidgets.QPushButton("Registrar evidencia")
+        self.btn.clicked.connect(self.seleccionar_archivo)
+        layout.addWidget(self.btn)
 
         self.lista = QtWidgets.QListWidget()
         layout.addWidget(self.lista)
 
-        botones_panel = QtWidgets.QHBoxLayout()
-        self.boton_auditoria = QtWidgets.QPushButton("Abrir panel de auditoria")
-        self.boton_auditoria.clicked.connect(self.abrir_auditoria)
-        self.boton_actualizar = QtWidgets.QPushButton("Actualizar lista")
-        self.boton_actualizar.clicked.connect(self.cargar_lista)
+        self.btn_audit = QtWidgets.QPushButton("Panel de auditoría")
+        self.btn_audit.clicked.connect(self.abrir_auditoria)
+        layout.addWidget(self.btn_audit)
 
-        botones_panel.addWidget(self.boton_auditoria)
-        botones_panel.addWidget(self.boton_actualizar)
-        layout.addLayout(botones_panel)
-
-        contenedor.setLayout(layout)
         self.setCentralWidget(contenedor)
-
         self.cargar_lista()
 
     def cargar_lista(self):
         self.lista.clear()
-        ledger = cargar_ledger()
-        for r in ledger:
-            self.lista.addItem(f"{r['archivo']}  |  {r['timestamp']}")
+        res = supabase.table("ledger_entries") \
+            .select("archivo, timestamp") \
+            .order("created_at", desc=True) \
+            .execute()
+
+        for r in res.data:
+            self.lista.addItem(f"{r['archivo']} | {r['timestamp']}")
 
     def seleccionar_archivo(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Seleccionar archivo de evidencia",
-            "",
-            "Todos los archivos (*.*)"
-        )
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self)
         if not path:
             return
 
-        hash_actual = calcular_hash(path)
-
-        if not os.path.exists("estudiante_priv.pem") or not os.path.exists("estudiante_pub.pem"):
+        if not os.path.exists("estudiante_priv.pem"):
             generar_claves("estudiante")
 
-        firma = firmar(hash_actual, "estudiante_priv.pem")
+        hash_archivo = calcular_hash(path)
+        firma = firmar(hash_archivo, "estudiante_priv.pem")
+        hash_prev = obtener_ultimo_block_hash()
 
-        ledger = cargar_ledger()
-        hash_prev = ledger[-1]["hash"] if ledger else None
-        recibo = crear_recibo(os.path.basename(path), hash_actual, firma, hash_prev)
-        ledger.append(recibo)
-        guardar_ledger(ledger)
+        recibo = {
+            "archivo": os.path.basename(path),
+            "hash": hash_archivo,
+            "firma": firma,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "hash_prev": hash_prev
+        }
 
+        recibo["block_hash"] = calcular_block_hash(recibo)
+
+        supabase.table("ledger_entries").insert(recibo).execute()
         self.cargar_lista()
 
-        QtWidgets.QMessageBox.information(
-            self,
-            "Registro completado",
-            "La evidencia se registro en el ledger con hash, firma digital y encadenamiento."
-        )
 
     def abrir_auditoria(self):
         self.panel = AuditoriaUI()
         self.panel.show()
 
 
+# =====================================================
+# PANEL DE AUDITORÍA
+# =====================================================
+
 class AuditoriaUI(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Panel de Auditoria del Proyecto de Ciberseguridad")
+        self.setWindowTitle("Auditoría del Ledger")
         self.resize(820, 520)
-        self.setStyleSheet("""
-        QWidget { background-color: #020617; color: #f9fafb; }
-        QListWidget {
-            background-color: #020617;
-            border: 1px solid #1f2937;
-        }
-        QPushButton {
-            background-color: #15803d;
-            border-radius: 6px;
-            padding: 8px 12px;
-        }
-        QPushButton:hover {
-            background-color: #16a34a;
-        }
-        """)
 
-        layout = QtWidgets.QVBoxLayout()
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(14)
-
-        titulo = QtWidgets.QLabel("Auditoria del Ledger y Raiz de Merkle")
-        titulo.setStyleSheet("font-size: 20px; font-weight: bold; color: #34d399;")
-        layout.addWidget(titulo)
-
-        descripcion = QtWidgets.QLabel(
-            "Esta vista permite revisar la secuencia de recibos generados, validar que el encadenamiento "
-            "entre bloques no se haya roto y calcular la raiz de Merkle que resume criptograficamente "
-            "las evidencias registradas."
-        )
-        descripcion.setWordWrap(True)
-        descripcion.setStyleSheet("font-size: 13px; color: #e5e7eb;")
-        layout.addWidget(descripcion)
+        layout = QtWidgets.QVBoxLayout(self)
 
         self.lista = QtWidgets.QListWidget()
         layout.addWidget(self.lista)
 
-        btn_layout = QtWidgets.QHBoxLayout()
-        self.boton_validar = QtWidgets.QPushButton("Validar cadena y calcular Merkle root")
-        self.boton_validar.clicked.connect(self.validar)
-        btn_layout.addWidget(self.boton_validar)
-        layout.addLayout(btn_layout)
+        self.btn = QtWidgets.QPushButton("Validar cadena y Merkle")
+        self.btn.clicked.connect(self.validar)
+        layout.addWidget(self.btn)
 
-        self.setLayout(layout)
         self.cargar()
 
     def cargar(self):
         self.lista.clear()
-        ledger = cargar_ledger()
+        ledger = cargar_ledger_db()
         for r in ledger:
-            self.lista.addItem(
-                f"{r['archivo']} | hash: {r['hash'][:12]}... | ts: {r['timestamp']}"
-            )
+            self.lista.addItem(f"{r['archivo']} | {r['hash'][:12]}...")
 
     def validar(self):
-        ledger = cargar_ledger()
-        if not ledger:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Sin datos",
-                "El ledger no contiene registros de evidencias."
-            )
-            return
+        ledger = cargar_ledger_db()
 
         cadena_ok = verificar_cadena(ledger)
-        hashes = [r["hash"] for r in ledger]
-        root = merkle_root(hashes)
+        firmas_ok = verificar_firmas(ledger)
+        root = merkle_root([r["block_hash"] for r in ledger])
 
-        if cadena_ok:
-            msg = (
-                "La cadena de recibos es consistente y el encadenamiento hash_prev coincide en todos los bloques.\n\n"
-                f"Raiz de Merkle calculada:\n{root}"
-            )
-            QtWidgets.QMessageBox.information(self, "Validacion correcta", msg)
-        else:
-            msg = (
-                "Se detecto una inconsistencia en el encadenamiento de la cadena.\n"
-                "Uno o mas bloques tienen un hash_prev que no coincide con el hash real del bloque anterior.\n\n"
-                f"Raiz de Merkle calculada (sobre los hashes actuales):\n{root}"
-            )
-            QtWidgets.QMessageBox.critical(self, "Cadena alterada", msg)
+        msg = (
+            f"Cadena válida: {cadena_ok}\n"
+            f"Firmas válidas: {firmas_ok}\n\n"
+            f"Merkle Root:\n{root}"
+        )
+
+        QtWidgets.QMessageBox.information(self, "Resultado de auditoría", msg)
 
 
 # =====================================================
-# EJECUCION DE LA APLICACION
+# MAIN
 # =====================================================
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    ventana = LockerUI()
-    ventana.show()
+    win = LockerUI()
+    win.show()
     sys.exit(app.exec())
 
 
